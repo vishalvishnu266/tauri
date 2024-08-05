@@ -1,18 +1,22 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::Arc;
 use broadcast::channel;
-use rusqlite::{Connection, Result};
+use r2d2::Pool;
+use r2d2_sqlite::rusqlite::{Connection, Result};
+use r2d2_sqlite::SqliteConnectionManager;
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use r2d2_sqlite::rusqlite::ffi::sqlite3_uint64;
 use tauri::State;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task;
 use tokio::time::{sleep, Duration};
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 enum DbRequest {
     Execute(String),
-    Query(String,broadcast::Sender<Result<String, String>>),
+    Query(String, broadcast::Sender<Result<String, String>>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -24,6 +28,8 @@ struct UserInfo {
 pub struct SharedState {
     tx: broadcast::Sender<String>,
     db_request_tx: broadcast::Sender<DbRequest>,
+    read_count: Arc<Mutex<u64>>,
+    write_count: Arc<Mutex<u64>>,
 }
 
 #[tauri::command]
@@ -49,13 +55,9 @@ fn hello(value: UserInfo) -> String {
 
 #[tauri::command]
 async fn greet(_value: UserInfo, state: State<'_, Arc<Mutex<SharedState>>>) -> Result<String, ()> {
-    let (response_tx, mut response_rx) =channel(1);
-    let request = DbRequest::Query(
-        "SELECT name FROM users ".to_string(),
-        response_tx,
-    );
+    let (response_tx, mut response_rx) = channel(1);
+    let request = DbRequest::Query("SELECT name FROM users limit 1 ".to_string(), response_tx);
     let shared_state = state.lock().await;
-
 
     // Send request and await response
     let _ = shared_state.db_request_tx.send(request);
@@ -83,13 +85,26 @@ fn noinput() -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // enable_wal_mode("your-database-file.db").await?;
 
-
+    let manager = SqliteConnectionManager::file("/home/x/new.db");
+    let pool = Pool::new(manager).unwrap();
+    let journal_mode: String = pool
+        .get()
+        .unwrap()
+        .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+        .expect("error wal");
+    println!("after wal");
+    pool.get()
+        .unwrap()
+        .execute("CREATE TABLE IF NOT EXISTS load (bar INTEGER)", [])
+        .unwrap();
     // Retrieve and print the row
     let (tx, _rx) = channel(16); // Buffer size of 16 messages
     let (db_request_tx, mut db_request_rx) = channel(16);
     let shared_state = Arc::new(Mutex::new(SharedState {
         tx,
-        db_request_tx
+        db_request_tx,
+        read_count: Arc::new(Mutex::new(0)),
+        write_count: Arc::new(Mutex::new(0)),
     }));
 
     // tokio::spawn(async {
@@ -101,8 +116,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //         sleep(Duration::from_secs(3)).await;
     //     }
     // });
+    let pooldb = pool.clone();
+
     tokio::spawn(async move {
-        let conn = Connection::open("/home/x/new.db").unwrap();
+        let conn = pooldb.get().unwrap();
+
+        // let journal_mode: String =
+        //     conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0)).expect("error wal");
+        // conn.execute(
+        //     "PRAGMA journal_mode=WAL;",[],
+        // ).expect("Error wal mode");
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS users (
                 name TEXT PRIMARY KEY,
@@ -110,7 +134,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 age TEXT
             )",
             [],
-        ).expect("Error creating table");
+        )
+        .expect("Error creating table");
+
+        // Insert data into the users table
+        conn.execute(
+                "INSERT INTO users (name, email, age) VALUES (?, ?, ?)",
+                &["vishal", "vishal@gmail.com", "100"])
+            .expect("error inserting user");
 
         while let Ok(request) = db_request_rx.recv().await {
             match request {
@@ -118,9 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     conn.execute(&sql, []).expect("Error executing SQL");
                 }
                 DbRequest::Query(query, sender) => {
-                    println!("{}",query);
+                    // println!("{}",query);
                     let mut stmt = conn.prepare(&query).unwrap();
-                    let result: Result<String, _> = stmt.query_row([], |row| row.get(0))
+                    let result: Result<String, _> = stmt
+                        .query_row([], |row| row.get(0))
                         .map_err(|e| e.to_string());
                     match &result {
                         Ok(value) => {
@@ -151,7 +183,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-
+    let writepool = pool.clone();
+    tokio::spawn(async move {
+        let mut counter = 1; // Start with different initial values for each task
+        loop {
+            match writepool
+                .get()
+                .unwrap()
+                .execute("INSERT INTO load (bar) VALUES (?)", &[&counter])
+            {
+                Ok(x) => println!("write task  success"),
+                Err(e) => println!("write task  error {}", e),
+            };
+            counter += 1;
+        }
+    });
+    // let readpool1 = pool.clone();
+    // tokio::spawn(async move {
+    //     let conn = readpool1.get().unwrap();
+    //     loop {
+    //         let mut stmt = conn.prepare("select * from load limit 1").unwrap();
+    //         let result: Result<sqlite3_uint64, _> = stmt
+    //             .query_row([], |row| row.get(0))
+    //             .map_err(|e| e.to_string());
+    //         match &result {
+    //             Ok(value) => {
+    //                 println!("read task 1 success{}", value);
+    //             }
+    //             Err(e) => {
+    //                 eprintln!("read task 1 error: {}", e);
+    //             }
+    //         }
+    //         let _ = sleep(Duration::from_secs(15));
+    //
+    //     }
+    // });
+    //
+    // let readpool2 = pool.clone();
+    // tokio::spawn(async move {
+    //     let conn = readpool2.get().unwrap();
+    //     loop {
+    //         let mut stmt = conn.prepare("select * from load limit 1").unwrap();
+    //         let result: Result<sqlite3_uint64, _> = stmt
+    //             .query_row([], |row| row.get(0))
+    //             .map_err(|e| e.to_string());
+    //         match &result {
+    //             Ok(value) => {
+    //                 println!("read task 2 success{}", value);
+    //             }
+    //             Err(e) => {
+    //                 eprintln!("read task 2 error: {}", e);
+    //             }
+    //         }
+    //         let _ = sleep(Duration::from_secs(15));
+    //
+    //     }
+    // });
     tauri::async_runtime::set(tokio::runtime::Handle::current());
 
     tauri::Builder::default()
@@ -176,4 +263,11 @@ async fn enable_wal_mode(db_path: &str) -> Result<()> {
 
         Ok(())
     })
+}
+fn generate_random_name(length: usize) -> String {
+    let charset: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = thread_rng();
+    (0..length)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
 }
